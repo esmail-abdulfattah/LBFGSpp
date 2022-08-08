@@ -1,24 +1,37 @@
-// Copyright (C) 2016-2022 Yixuan Qiu <yixuan.qiu@cos.name>
+// Copyright (C) 2016-2020 Yixuan Qiu <yixuan.qiu@cos.name>
 // Under MIT license
 
-#ifndef LBFGSPP_LBFGS_H
-#define LBFGSPP_LBFGS_H
+#ifndef LBFGS_H
+#define LBFGS_H
 
-#include <Eigen/Core>
+#include "Eigen/Core"
 #include "LBFGSpp/Param.h"
 #include "LBFGSpp/BFGSMat.h"
 #include "LBFGSpp/LineSearchBacktracking.h"
 #include "LBFGSpp/LineSearchBracketing.h"
 #include "LBFGSpp/LineSearchNocedalWright.h"
-#include "LBFGSpp/LineSearchMoreThuente.h"
+
+//boost bimap
+#include <boost/bimap.hpp>
+#include <boost/bimap/unconstrained_set_of.hpp>
+#include <boost/bimap/multiset_of.hpp>
+#include <boost/bimap/support/lambda.hpp>
+typedef boost::bimap<std::string,double> bimap;
+
+
+//autodiff
+#include <boost/math/differentiation/autodiff.hpp>
+#include <boost/multiprecision/cpp_bin_float.hpp>
+
 
 namespace LBFGSpp {
+
 
 ///
 /// L-BFGS solver for unconstrained numerical optimization
 ///
-template <typename Scalar,
-          template <class> class LineSearch = LineSearchNocedalWright>
+template < typename Scalar,
+           template<class> class LineSearch = LineSearchBacktracking >
 class LBFGSSolver
 {
 private:
@@ -27,13 +40,15 @@ private:
     typedef Eigen::Map<Vector> MapVec;
 
     const LBFGSParam<Scalar>& m_param;  // Parameters to control the LBFGS algorithm
-    BFGSMat<Scalar> m_bfgs;             // Approximation to the Hessian matrix
-    Vector m_fx;                        // History of the objective function values
-    Vector m_xp;                        // Old x
-    Vector m_grad;                      // New gradient
-    Scalar m_gnorm;                     // Norm of the gradient
-    Vector m_gradp;                     // Old gradient
-    Vector m_drt;                       // Moving direction
+    BFGSMat<Scalar>           m_bfgs;   // Approximation to the Hessian matrix
+    Vector                    m_fx;     // History of the objective function values
+    Vector                    m_xp;     // Old x
+    Vector                    m_grad;   // New gradient
+    Vector                    m_gradp;  // Old gradient
+    Vector                    m_drt;    // Moving direction
+    Vector                    prev_x;    // Moving direction
+    double                    f_prev;    // Moving direction
+    double                    prev_gnorm = 9999;    // Moving direction
 
     // Reset internal variables
     // n: dimension of the vector to be optimized
@@ -45,15 +60,17 @@ private:
         m_grad.resize(n);
         m_gradp.resize(n);
         m_drt.resize(n);
-        if (m_param.past > 0)
+        if(m_param.past > 0)
             m_fx.resize(m_param.past);
+        f_prev = 0;
+        prev_x.resize(n);
     }
 
 public:
     ///
     /// Constructor for the L-BFGS solver.
     ///
-    /// \param param An object of \ref LBFGSParam to store parameters for the
+    /// \param param An object of \ref LBFGSParam to store paremtrs for the
     ///        algorithm
     ///
     LBFGSSolver(const LBFGSParam<Scalar>& param) :
@@ -76,7 +93,7 @@ public:
     /// \return Number of iterations used.
     ///
     template <typename Foo>
-    inline int minimize(Foo& f, Vector& x, Scalar& fx)
+    inline int minimize(Foo& f, Vector& x, Scalar& fx, ptr_bowl &parameters,col_vector &xstar)
     {
         using std::abs;
 
@@ -88,16 +105,13 @@ public:
         const int fpast = m_param.past;
 
         // Evaluate function and compute gradient
-        fx = f(x, m_grad);
-        m_gnorm = m_grad.norm();
-        if (fpast > 0)
+        fx = f(x, m_grad,parameters,xstar);
+        Scalar gnorm = m_grad.norm();
+        if(fpast > 0)
             m_fx[0] = fx;
 
-        // std::cout << "x0 = " << x.transpose() << std::endl;
-        // std::cout << "f(x0) = " << fx << ", ||grad|| = " << m_gnorm << std::endl << std::endl;
-
         // Early exit if the initial x is already a minimizer
-        if (m_gnorm <= m_param.epsilon || m_gnorm <= m_param.epsilon_rel * x.norm())
+        if(gnorm <= m_param.epsilon || gnorm <= m_param.epsilon_rel * x.norm())
         {
             return 1;
         }
@@ -109,45 +123,90 @@ public:
 
         // Number of iterations used
         int k = 1;
-        for (;;)
+        for( ; ; )
         {
-            // std::cout << "Iter " << k << " begins" << std::endl << std::endl;
-
             // Save the curent x and gradient
             m_xp.noalias() = x;
             m_gradp.noalias() = m_grad;
-            Scalar dg = m_grad.dot(m_drt);
-            const Scalar step_max = m_param.max_step;
 
             // Line search to update x, fx and gradient
-            LineSearch<Scalar>::LineSearch(f, m_param, m_xp, m_drt, step_max, step, fx, m_grad, dg, x);
+            f_prev = fx;
+            prev_x = x;
+            LineSearch<Scalar>::LineSearch(f, fx, x, m_grad, step, m_drt, m_xp, m_param,parameters,xstar);
+            (*parameters).optim->n_iter++; 
 
             // New gradient norm
-            m_gnorm = m_grad.norm();
-
-            // std::cout << "Iter " << k << " finished line search" << std::endl;
-            // std::cout << "   x = " << x.transpose() << std::endl;
-            // std::cout << "   f(x) = " << fx << ", ||grad|| = " << m_gnorm << std::endl << std::endl;
+            gnorm = m_grad.norm();
+            
 
             // Convergence test -- gradient
-            if (m_gnorm <= m_param.epsilon || m_gnorm <= m_param.epsilon_rel * x.norm())
+
+            /*
+            std::cout << "Test" << gnorm << std::endl;
+            std::cout << m_param.epsilon << std::endl;
+            std::cout <<  x.norm() << std::endl;
+            std::cout << m_param.epsilon_rel * x.norm() << std::endl;
+            */
+
+            //is added: gnorm < 0.2 before
+
+            if(gnorm <= m_param.epsilon || gnorm <= m_param.epsilon_rel * x.norm())
             {
+                std::cout << "Criteria is satisfied with a good optimum"; 
                 return k;
             }
-            // Convergence test -- objective function value
-            if (fpast > 0)
+
+            // Maximum number of iterations
+            if(m_param.max_iterations != 0 && k >= m_param.max_iterations)
+            {
+                std::cout << "Criteria is satisfied with a good optimum"; 
+                return k;
+            }
+
+            if(fpast > 0)
             {
                 const Scalar fxd = m_fx[k % fpast];
-                if (k >= fpast && abs(fxd - fx) <= m_param.delta * std::max(std::max(abs(fx), abs(fxd)), Scalar(1)))
+                if(k >= fpast && abs(fxd - fx) <= m_param.delta * std::max(std::max(abs(fx), abs(fxd)), Scalar(1))){
+                    std::cout << "Criteria is satisfied with a good optimum"; 
                     return k;
+                }
 
                 m_fx[k % fpast] = fx;
             }
-            // Maximum number of iterations
-            if (m_param.max_iterations != 0 && k >= m_param.max_iterations)
-            {
-                return k;
+
+            if(true){
+                int s1 = (*parameters).y_size, s2 = (*parameters).y_size, s3 = (*parameters).num_Con;
+                double threshold1 = (1e-3)*sqrt(s1),  threshold2 = (1e-3)*sqrt(s1), threshold3 = 5e-3*sqrt(s1), threshold4 =  4e-3*sqrt(s1); //0.03*sqrt((*parameters).num_Con);
+
+                std::cout << "fx = " << fx <<  " ,|gnorm| " << abs(gnorm) << ", |x - x.old|: " << abs((x-prev_x).norm()) << ", |f - f.old|: " << abs(fx -f_prev) << std::endl;
+                //std::cout << std::endl;
+
+                if(abs(gnorm) < threshold1 && abs((x-prev_x).norm())< threshold2) {std::cout << "Criteria is satisfied with a good optimum"; return k;}
+                if(abs(gnorm) < threshold1 && abs(fx -f_prev)< threshold1) {std::cout << "Criteria is satisfied with a good optimum"; return k;}
+                if(abs((x-prev_x).norm())< threshold2 && abs(fx -f_prev)< threshold1) {std::cout << "Criteria is satisfied with a good optimum"; return k;}
+                if(abs(gnorm) < 1e-1 && abs((x-prev_x).norm())< 1e-2 && abs(fx -f_prev)<1e-3) {std::cout << "Criteria is satisfied with a good optimum"; return k;}
+                //if(abs(gnorm) < threshold4 && abs((x-prev_x).norm())< threshold4 && abs(fx -f_prev)<threshold4) {std::cout << "Criteria 4 is satisfied" << std::endl; return k;}
+                //if(abs(gnorm) < 1.8 && abs((x-prev_x).norm())< 0.6 && abs(fx -f_prev)<0.6) {std::cout << "Criteria 4 is satisfied" << std::endl; return k;}
+           
+            }else{
+
+                double stop_threshold = 1e-3*std::sqrt(m_param.data_size); //previously datasize is xsize + ysize and it was 1e-4
+                std::cout << "threshold: " << stop_threshold <<  ", |gnorm| " << abs(gnorm) << ", |x - x.old|: " << abs((x-prev_x).norm()) << ", |f - f.old|: " << abs(fx -f_prev) << std::endl;
+                std::cout << std::endl;
+                //if(abs(gnorm) < stop_threshold || abs((x-prev_x).norm())< stop_threshold || abs(fx -f_prev)< stop_threshold) return k;
+                
+                if(abs(gnorm) < stop_threshold && abs((x-prev_x).norm())< stop_threshold) return k;
+                if(abs(gnorm) < stop_threshold && abs(fx -f_prev)< stop_threshold) return k;
+                if(abs((x-prev_x).norm())< stop_threshold && abs(fx -f_prev)< stop_threshold) return k;
+                if(abs(gnorm) < 1e-1 && abs((x-prev_x).norm())< 1e-2 && abs(fx -f_prev)<1e-3) return k;
             }
+            
+            
+
+           
+
+            //if(abs(gnorm) < 0.5 && prev_gnorm < 0.5 && abs((x-prev_x).norm())< 1e-2 && abs(fx -f_prev)<1e-3) return k;
+            //prev_gnorm = abs(gnorm);
 
             // Update s and y
             // s_{k+1} = x_{k+1} - x_k
@@ -164,22 +223,9 @@ public:
 
         return k;
     }
-
-    ///
-    /// Returning the gradient vector on the last iterate.
-    /// Typically used to debug and test convergence.
-    /// Should only be called after the `minimize()` function.
-    ///
-    /// \return A const reference to the gradient vector.
-    ///
-    const Vector& final_grad() const { return m_grad; }
-
-    ///
-    /// Returning the Euclidean norm of the final gradient.
-    ///
-    Scalar final_grad_norm() const { return m_gnorm; }
 };
 
-}  // namespace LBFGSpp
 
-#endif  // LBFGSPP_LBFGS_H
+} // namespace LBFGSpp
+
+#endif // LBFGS_H

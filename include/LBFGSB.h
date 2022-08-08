@@ -1,25 +1,27 @@
-// Copyright (C) 2020-2022 Yixuan Qiu <yixuan.qiu@cos.name>
+// Copyright (C) 2020 Yixuan Qiu <yixuan.qiu@cos.name>
 // Under MIT license
 
-#ifndef LBFGSPP_LBFGSB_H
-#define LBFGSPP_LBFGSB_H
+#ifndef LBFGSB_H
+#define LBFGSB_H
 
 #include <stdexcept>  // std::invalid_argument
 #include <vector>
-#include <Eigen/Core>
+#include "Eigen/Core"
 #include "LBFGSpp/Param.h"
 #include "LBFGSpp/BFGSMat.h"
 #include "LBFGSpp/Cauchy.h"
 #include "LBFGSpp/SubspaceMin.h"
 #include "LBFGSpp/LineSearchMoreThuente.h"
 
+
 namespace LBFGSpp {
+
 
 ///
 /// L-BFGS-B solver for box-constrained numerical optimization
 ///
-template <typename Scalar,
-          template <class> class LineSearch = LineSearchMoreThuente>
+template < typename Scalar,
+           template<class> class LineSearch = LineSearchMoreThuente >
 class LBFGSBSolver
 {
 private:
@@ -29,13 +31,14 @@ private:
     typedef std::vector<int> IndexSet;
 
     const LBFGSBParam<Scalar>& m_param;  // Parameters to control the LBFGS algorithm
-    BFGSMat<Scalar, true> m_bfgs;        // Approximation to the Hessian matrix
-    Vector m_fx;                         // History of the objective function values
-    Vector m_xp;                         // Old x
-    Vector m_grad;                       // New gradient
-    Scalar m_projgnorm;                  // Projected gradient norm
-    Vector m_gradp;                      // Old gradient
-    Vector m_drt;                        // Moving direction
+    BFGSMat<Scalar, true>      m_bfgs;   // Approximation to the Hessian matrix
+    Vector                     m_fx;     // History of the objective function values
+    Vector                     m_xp;     // Old x
+    Vector                     m_grad;   // New gradient
+    Vector                     m_gradp;  // Old gradient
+    Vector                     m_drt;    // Moving direction
+    Scalar                    f_prev;    // Moving direction
+    Vector                     x_prev;    // Moving direction
 
     // Reset internal variables
     // n: dimension of the vector to be optimized
@@ -47,8 +50,12 @@ private:
         m_grad.resize(n);
         m_gradp.resize(n);
         m_drt.resize(n);
-        if (m_param.past > 0)
+        if(m_param.past > 0)
             m_fx.resize(m_param.past);
+        
+        f_prev = 0;
+        x_prev.resize(n);
+
     }
 
     // Project the vector x to the bound constraint set
@@ -70,14 +77,12 @@ private:
         const int n = x0.size();
         Scalar step = std::numeric_limits<Scalar>::infinity();
 
-        for (int i = 0; i < n; i++)
+        for(int i = 0; i < n; i++)
         {
-            if (drt[i] > Scalar(0))
+            if(drt[i] > Scalar(0))
             {
                 step = std::min(step, (ub[i] - x0[i]) / drt[i]);
-            }
-            else if (drt[i] < Scalar(0))
-            {
+            } else if(drt[i] < Scalar(0)) {
                 step = std::min(step, (lb[i] - x0[i]) / drt[i]);
             }
         }
@@ -114,13 +119,13 @@ public:
     /// \return Number of iterations used.
     ///
     template <typename Foo>
-    inline int minimize(Foo& f, Vector& x, Scalar& fx, const Vector& lb, const Vector& ub)
+    inline int minimize(Foo& f, Vector& x, Scalar& fx, const Vector& lb, const Vector& ub, ptr_bowl &parameters,col_vector &xstar)
     {
         using std::abs;
 
         // Dimension of the vector
         const int n = x.size();
-        if (lb.size() != n || ub.size() != n)
+        if(lb.size() != n || ub.size() != n)
             throw std::invalid_argument("'lb' and 'ub' must have the same size as 'x'");
 
         // Check whether the initial vector is within the bounds
@@ -134,16 +139,16 @@ public:
         const int fpast = m_param.past;
 
         // Evaluate function and compute gradient
-        fx = f(x, m_grad);
-        m_projgnorm = proj_grad_norm(x, m_grad, lb, ub);
-        if (fpast > 0)
+        fx = f(x, m_grad,parameters,xstar);
+        Scalar projgnorm = proj_grad_norm(x, m_grad, lb, ub);
+        if(fpast > 0)
             m_fx[0] = fx;
 
         // std::cout << "x0 = " << x.transpose() << std::endl;
-        // std::cout << "f(x0) = " << fx << ", ||proj_grad|| = " << m_projgnorm << std::endl << std::endl;
+        // std::cout << "f(x0) = " << fx << ", ||proj_grad|| = " << projgnorm << std::endl << std::endl;
 
         // Early exit if the initial x is already a minimizer
-        if (m_projgnorm <= m_param.epsilon || m_projgnorm <= m_param.epsilon_rel * x.norm())
+        if(projgnorm <= m_param.epsilon || projgnorm <= m_param.epsilon_rel * x.norm())
         {
             return 1;
         }
@@ -168,63 +173,107 @@ public:
         Vector vecs(n), vecy(n);
         // Number of iterations used
         int k = 1;
-        for (;;)
+        for( ; ; )
         {
             // Save the curent x and gradient
             m_xp.noalias() = x;
             m_gradp.noalias() = m_grad;
-            Scalar dg = m_grad.dot(m_drt);
-
-            // Maximum step size to make x feasible
-            Scalar step_max = max_step_size(x, m_drt, lb, ub);
-            
-            // In some cases, the direction returned by the subspace minimization procedure
-            // in the previous iteration is pathological, leading to issues such as
-            // step_max~=0 and dg>=0. If this happens, we use xcp-x as the search direction,
-            // and reset the BFGS matrix. This is because xsm (the subspace minimizer)
-            // heavily depends on the BFGS matrix. If xsm is corrupted, then we may suspect
-            // there is something wrong in the BFGS matrix, and it is safer to reset the matrix.
-            // In contrast, xcp is obtained from a line search, which tends to be more robust
-            if (dg >= Scalar(0) || step_max <= m_param.min_step)
-            {
-               // Reset search direction
-                m_drt.noalias() = xcp - x;
-                // Reset BFGS matrix
-                m_bfgs.reset(n, m_param.m);
-                // Recompute dg and step_max
-                dg = m_grad.dot(m_drt);
-                step_max = max_step_size(x, m_drt, lb, ub);
-            }
 
             // Line search to update x, fx and gradient
+            Scalar step_max = max_step_size(x, m_drt, lb, ub);
             step_max = std::min(m_param.max_step, step_max);
             Scalar step = Scalar(1);
             step = std::min(step, step_max);
-            LineSearch<Scalar>::LineSearch(f, m_param, m_xp, m_drt, step_max, step, fx, m_grad, dg, x);
+
+            f_prev = fx;
+            x_prev = x;
+            LineSearch<Scalar>::LineSearch(f, fx, x, m_grad, step, step_max, m_drt, m_xp, m_param,parameters,xstar);
+            (*parameters).optim->n_iter++; 
 
             // New projected gradient norm
-            m_projgnorm = proj_grad_norm(x, m_grad, lb, ub);
+            projgnorm = proj_grad_norm(x, m_grad, lb, ub);
 
             /* std::cout << "** Iteration " << k << std::endl;
             std::cout << "   x = " << x.transpose() << std::endl;
-            std::cout << "   f(x) = " << fx << ", ||proj_grad|| = " << m_projgnorm << std::endl << std::endl; */
+            std::cout << "   f(x) = " << fx << ", ||proj_grad|| = " << projgnorm << std::endl << std::endl; */
 
             // Convergence test -- gradient
-            if (m_projgnorm <= m_param.epsilon || m_projgnorm <= m_param.epsilon_rel * x.norm())
-            {
+            if(projgnorm <= m_param.epsilon || projgnorm <= m_param.epsilon_rel * x.norm())
+            {   
+                std::cout << "Criteria is satisfied with a good optimum"; 
                 return k;
             }
             // Convergence test -- objective function value
-            if (fpast > 0)
+            
+
+
+            if(true){
+                int s1 = (*parameters).y_size;
+                double threshold1 = (1e-3)*sqrt(s1),  threshold2 = threshold2 =  (3e-3)*sqrt(s1); 
+
+                std::cout << "fx = " << fx <<  " ,|gnorm| " << projgnorm << ", |x - x.old|: " << abs((x-x_prev).norm()) << ", |f - f.old|: " << abs(f_prev - fx) << std::endl;
+                //std::cout << std::endl;
+
+                //std::cout << "fx is " <<  fx << std::endl;
+                if(projgnorm < threshold2 && abs(f_prev - fx) < threshold1) {
+                    std::cout << "Criteria is satisfied "; 
+                    if((*parameters).optim->opt_satisfied){
+                        std::cout << "with a good optimum" << std::endl; 
+                        return k; 
+
+                    }else {
+                        (*parameters).optim->opt_satisfied = true;
+                        std::cout << "but we are looking for a better optimum" << std::endl; 
+                        (*parameters).optim->central = true;
+                        throw (*parameters).optim->peppers;
+                    }
+                }
+                if(projgnorm < threshold2 && abs((x_prev - x).norm()) < threshold1) {
+                    std::cout << "Criteria is satisfied "; 
+                    if((*parameters).optim->opt_satisfied){
+                        std::cout << "with a good optimum" << std::endl; 
+                        return k; 
+                        
+                    }else {
+                        (*parameters).optim->opt_satisfied = true;
+                        std::cout << "but we are looking for a better optimum" << std::endl;      
+                        (*parameters).optim->central = true;                  
+                        throw (*parameters).optim->peppers;
+                    }
+                }
+                if(abs((x_prev - x).norm()) < threshold1 && abs(f_prev - fx) < threshold1) {
+                    std::cout << "Criteria is satisfied "; 
+                    if((*parameters).optim->opt_satisfied){
+                        std::cout << "with a good optimum" << std::endl; 
+                        return k; 
+                        
+                    }else {
+                        (*parameters).optim->opt_satisfied = true;
+                        std::cout << "but we are looking for a better optimum" << std::endl; 
+                        (*parameters).optim->central = true;
+                        throw (*parameters).optim->peppers;
+                    }
+                }
+                //if(abs(gnorm) < 1e-1 && abs((x-prev_x).norm())< 1e-2 && abs(fx -f_prev)<1e-3) {std::cout << "Criteria 4 is satisfied" << std::endl; return k;}
+                //if(abs(gnorm) < threshold4 && abs((x-prev_x).norm())< threshold4 && abs(fx -f_prev)<threshold4) {std::cout << "Criteria 4 is satisfied" << std::endl; return k;}
+                //if(abs(gnorm) < 1.8 && abs((x-prev_x).norm())< 0.6 && abs(fx -f_prev)<0.6) {std::cout << "Criteria 4 is satisfied" << std::endl; return k;}
+            }
+        
+           const Scalar fxd = m_fx[k % fpast];
+           if(fpast > 0)
             {
-                const Scalar fxd = m_fx[k % fpast];
-                if (k >= fpast && abs(fxd - fx) <= m_param.delta * std::max(std::max(abs(fx), abs(fxd)), Scalar(1)))
+                if(k >= fpast && abs(fxd - fx) <= m_param.delta * std::max(std::max(abs(fx), abs(fxd)), Scalar(1))){
+                    std::cout << "Criteria is satisfied with a good optimum"; 
                     return k;
+                }
+                    
 
                 m_fx[k % fpast] = fx;
             }
+
+
             // Maximum number of iterations
-            if (m_param.max_iterations != 0 && k >= m_param.max_iterations)
+            if(m_param.max_iterations != 0 && k >= m_param.max_iterations)
             {
                 return k;
             }
@@ -234,7 +283,7 @@ public:
             // y_{k+1} = g_{k+1} - g_k
             vecs.noalias() = x - m_xp;
             vecy.noalias() = m_grad - m_gradp;
-            if (vecs.dot(vecy) > eps * vecy.squaredNorm())
+            if(vecs.dot(vecy) > eps * vecy.squaredNorm())
                 m_bfgs.add_correction(vecs, vecy);
 
             force_bounds(x, lb, ub);
@@ -247,7 +296,7 @@ public:
             std::cout << "f(xcp) = " << fcp << ", ||proj_grad|| = " << projgcpnorm << std::endl << std::endl;*/
 
             SubspaceMin<Scalar>::subspace_minimize(m_bfgs, x, xcp, m_grad, lb, ub,
-                                                   vecc, newact_set, fv_set, m_param.max_submin, m_drt);
+                vecc, newact_set, fv_set, m_param.max_submin, m_drt);
 
             /*Vector gsm(n);
             Scalar fsm = f(x + m_drt, gsm);
@@ -260,25 +309,9 @@ public:
 
         return k;
     }
-
-    ///
-    /// Returning the gradient vector on the last iterate.
-    /// Typically used to debug and test convergence.
-    /// Should only be called after the `minimize()` function.
-    ///
-    /// \return A const reference to the gradient vector.
-    ///
-    const Vector& final_grad() const { return m_grad; }
-
-    ///
-    /// Returning the infinity norm of the final projected gradient.
-    /// The projected gradient is defined as \f$P(x-g,l,u)-x\f$, where \f$P(v,l,u)\f$ stands for
-    /// the projection of a vector \f$v\f$ onto the box specified by the lower bound vector \f$l\f$ and
-    /// upper bound vector \f$u\f$.
-    ///
-    Scalar final_grad_norm() const { return m_projgnorm; }
 };
 
-}  // namespace LBFGSpp
 
-#endif  // LBFGSPP_LBFGSB_H
+} // namespace LBFGSpp
+
+#endif // LBFGSB_H
